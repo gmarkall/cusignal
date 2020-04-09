@@ -16,8 +16,9 @@ import warnings
 from string import Template
 
 import cupy as cp
-from numba import complex64, complex128, cuda, float32, float64, int64, void
-from numba.types.scalars import Complex
+from numba import (complex64, complex128, cuda, float32, float64, int64, void,
+                   int32)
+from numba.core.types.scalars import Complex
 
 _numba_kernel_cache = {}
 _cupy_kernel_cache = {}
@@ -135,12 +136,12 @@ def _numba_upfirdn_1d(
     X = cuda.grid(1)
     strideX = cuda.gridsize(1)
 
-    for i in range(X, cp.int32(out.shape[0]), strideX):
+    for i in range(X, int32(out.shape[0]), strideX):
 
-        x_idx = cp.int32(cp.int32(cp.int32(i * down) // up) % padded_len)
-        h_idx = cp.int32(cp.int32(cp.int32(i * down) % up) * h_per_phase)
+        x_idx = int32(int32(int32(i * down) // up) % padded_len)
+        h_idx = int32(int32(int32(i * down) % up) * h_per_phase)
 
-        x_conv_idx = x_idx - h_per_phase + 1
+        x_conv_idx = int32(int32(x_idx - h_per_phase) + 1)
         if x_conv_idx < 0:
             h_idx -= x_conv_idx
             x_conv_idx = 0
@@ -160,14 +161,24 @@ def _numba_upfirdn_signature(ty, ndim):
     return void(
         arr_ty,  # x
         ty[:],   # h_trans_flip
-        int64,   # up
-        int64,   # down
-        int64,   # axis
-        int64,   # x_shape_a
-        int64,   # h_per_phase
-        int64,   # padded_len
+        int32,   # up
+        int32,   # down
+        int32,   # axis
+        int32,   # x_shape_a
+        int32,   # h_per_phase
+        int32,   # padded_len
         arr_ty,  # out
     )
+
+
+_numba_upfirdn_locals = {
+    'X': int32,
+    'strideX ': int32,
+    'i': int32,
+    'x_idx': int32,
+    'h_idx': int32,
+    'x_conv_idx': int32,
+}
 
 
 # Custom Cupy raw kernel implementing upsample, filter, downsample operation
@@ -284,12 +295,17 @@ def _populate_kernel_cache():
     for numba_type, c_type in _SUPPORTED_TYPES.items():
         # JIT compile the numba kernels, both 1d and 2d
         sig_1d = _numba_upfirdn_signature(numba_type, 1)
-        _numba_kernel_cache[(1, str(numba_type))] = \
-            cuda.jit(sig_1d, fastmath=True)(_numba_upfirdn_1d)
+        k = cuda.jit(sig_1d, fastmath=True, locals=_numba_upfirdn_locals)(_numba_upfirdn_1d)
+        print("1D (%d, %s): %d registers" % (1, numba_type,
+                                             k._func.get().attrs.regs))
+        #print(k.inspect_asm())
+        _numba_kernel_cache[(1, str(numba_type))] = k
 
         sig_2d = _numba_upfirdn_signature(numba_type, 2)
-        _numba_kernel_cache[(2, str(numba_type))] = \
-            cuda.jit(sig_2d, fastmath=True)(_numba_upfirdn_2d)
+        k = cuda.jit(sig_2d, fastmath=True)(_numba_upfirdn_2d)
+        print("2D (%d, %s): %d registers" % (1, numba_type,
+                                             k._func.get().attrs.regs))
+        _numba_kernel_cache[(2, str(numba_type))] = k
 
         # Instantiate the cupy kernel for this type and compile
         if isinstance(numba_type, Complex):
@@ -299,8 +315,9 @@ def _populate_kernel_cache():
         src = loaded_from_source.substitute(datatype=c_type, header=header)
         module2 = cp.RawModule(code=src,
                                options=("-std=c++11", "-use_fast_math"))
-        _cupy_kernel_cache[(1, str(numba_type))] = \
-            module2.get_function("_cupy_upfirdn_1d")
+        k = module2.get_function("_cupy_upfirdn_1d")
+        print("cupy: %d regs" % k.num_regs)
+        _cupy_kernel_cache[(1, str(numba_type))] = k
 
 
 class _UpFIRDn(object):
